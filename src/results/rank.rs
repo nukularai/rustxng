@@ -94,6 +94,44 @@ pub fn relevance_score(result: &SearchResult, terms: &[String]) -> f64 {
     relevance(&result.url, &result.title, &result.content, terms)
 }
 
+/// How much of the query the title and snippet of a result cover
+/// (0.0 ..= 1.0).
+///
+/// This is the text-only companion of [relevance]: it ignores the URL
+/// slug, path depth and identifier bonuses, so a page whose *title* answers
+/// the query is lifted even when its address does not repeat the terms.
+/// The title is the page's own label and weighs more than the snippet.
+pub(crate) fn text_match(title: &str, content: &str, terms: &[String]) -> f64 {
+    if terms.is_empty() {
+        return 0.0;
+    }
+    let title = title.to_lowercase();
+    let snippet: String = content.chars().take(600).collect::<String>().to_lowercase();
+    let title_hits = terms
+        .iter()
+        .filter(|term| title.contains(term.as_str()))
+        .count();
+    let snippet_hits = terms
+        .iter()
+        .filter(|term| snippet.contains(term.as_str()))
+        .count();
+    let title_coverage = title_hits as f64 / terms.len() as f64;
+    let snippet_coverage = snippet_hits as f64 / terms.len() as f64;
+    0.7 * title_coverage + 0.3 * snippet_coverage
+}
+
+/// Agreement of independent sources, in 0.0 ..= 1.0.
+///
+/// One source is 0.0, two are 0.5, three are 0.67: the value grows with every
+/// additional engine but never reaches 1.0, so engine count cannot outweigh
+/// the position fusion on its own.
+pub(crate) fn consensus(source_count: usize) -> f64 {
+    if source_count <= 1 {
+        return 0.0;
+    }
+    (source_count as f64 - 1.0) / source_count as f64
+}
+
 /// A brand/site the user names in the query, with its canonical hosts.
 struct Authority {
     /// Query substrings that name the site (lowercase).
@@ -756,6 +794,31 @@ mod tests {
             Some("docs.docker.com")
         );
         assert_eq!(canonical_host_for_query("some random topic"), None);
+    }
+
+    #[test]
+    fn title_and_snippet_matches_are_counted_separately_from_the_url() {
+        let terms = query_terms("async runtime tutorial");
+        let titled = text_match("Async runtime tutorial", "how to use the runtime", &terms);
+        let snippet_only = text_match(
+            "Some page",
+            "an async runtime tutorial for beginners",
+            &terms,
+        );
+        let missing = text_match("Unrelated", "nothing here", &terms);
+        assert!(titled > snippet_only, "{titled} vs {snippet_only}");
+        assert!(snippet_only > missing);
+        assert_eq!(missing, 0.0);
+        assert_eq!(text_match("anything", "anything", &[]), 0.0);
+    }
+
+    #[test]
+    fn consensus_grows_with_the_number_of_sources() {
+        assert_eq!(consensus(0), 0.0);
+        assert_eq!(consensus(1), 0.0);
+        assert_eq!(consensus(2), 0.5);
+        assert!(consensus(3) > consensus(2));
+        assert!(consensus(10) < 1.0, "it never reaches one");
     }
 
     #[test]

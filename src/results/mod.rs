@@ -12,7 +12,8 @@ mod rank;
 pub use rank::{canonical_host_for_query, page_language, query_terms, relevance_score};
 
 use rank::{
-    authority, order_results, page_language_adjustment, relevance, wikipedia_language_penalty,
+    authority, consensus, order_results, page_language_adjustment, relevance, text_match,
+    wikipedia_language_penalty,
 };
 
 /// Result priority, upstream `MainResult.PriorityType`.
@@ -262,12 +263,53 @@ pub struct UnresponsiveEngine {
     pub suspended: bool,
 }
 
+/// Ranking coefficients blended into the position-fusion score.
+///
+/// The existing terms keep their meaning: relevance is the URL + title +
+/// body coverage term and authority the canonical-site term. Consensus and
+/// text_match are additive and default to zero for callers that use
+/// ResultContainer::close, so the historical ranking API is unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RankingOptions {
+    pub relevance: f64,
+    pub authority: f64,
+    /// Weight of the multi-source agreement bonus.
+    pub consensus: f64,
+    /// Weight of the title/snippet query-term match bonus.
+    pub text_match: f64,
+}
+
+/// How aggressively duplicate pages are collapsed while collecting results.
+///
+/// Both rules are conservative: a URL is only rewritten when it carries an
+/// unmistakable copy marker, and a body match needs the same host, the same
+/// title and a near-identical snippet. Turning them off restores the previous
+/// URL-only deduplication, which is what the offline regression uses as its
+/// baseline.
+#[derive(Debug, Clone, Copy)]
+pub struct DedupPolicy {
+    /// Strip AMP / mobile / print markers from a URL before comparing it.
+    pub url_variants: bool,
+    /// Merge same-host results whose title and body are nearly identical.
+    pub near_duplicates: bool,
+}
+
+impl Default for DedupPolicy {
+    fn default() -> Self {
+        Self {
+            url_variants: true,
+            near_duplicates: true,
+        }
+    }
+}
+
 /// Collects, deduplicates and scores the results of all engines.
 #[derive(Debug, Default)]
 pub struct ResultContainer {
     main: Vec<SearchResult>,
     index: HashMap<String, usize>,
     source_ranks: Vec<Vec<SourceRank>>,
+    dedup: DedupPolicy,
     pub infoboxes: Vec<Infobox>,
     pub suggestions: BTreeSet<String>,
     pub answers: Vec<String>,
@@ -344,108 +386,151 @@ impl ResultContainer {
         let mut position = page_offset.saturating_mul(PAGE_POSITION_STRIDE);
         let deep_page = page_offset;
         for (weight, item) in items {
-            match item {
-                EngineItem::Suggestion(suggestion) => {
-                    if !suggestion.trim().is_empty() {
-                        self.suggestions.insert(suggestion);
-                    }
+            self.merge_item(engine_name, weight, item, deep_page, &mut position);
+        }
+    }
+
+    /// Merge results at the positions the caller recorded.
+    ///
+    /// The regular extend renumbers positions from one. A recorded replay has
+    /// to keep the recorded values (and their gaps), so a result an engine
+    /// placed at 7 keeps 1/7 in the position fusion. This entry point exists
+    /// for the offline regression, which is why it is test-only.
+    #[cfg(test)]
+    pub(crate) fn extend_at_positions(
+        &mut self,
+        engine_name: &str,
+        weight: f64,
+        items: Vec<(u32, EngineItem)>,
+    ) {
+        if self.closed {
+            return;
+        }
+        for (position, item) in items {
+            let mut position = position.max(1);
+            self.merge_item(engine_name, weight, item, 0, &mut position);
+        }
+    }
+
+    fn merge_item(
+        &mut self,
+        engine_name: &str,
+        weight: f64,
+        item: EngineItem,
+        deep_page: u32,
+        position: &mut u32,
+    ) {
+        match item {
+            EngineItem::Suggestion(suggestion) => {
+                if !suggestion.trim().is_empty() {
+                    self.suggestions.insert(suggestion);
                 }
-                EngineItem::Answer(answer) => self.answers.push(answer),
-                EngineItem::Correction(correction) => {
-                    if !correction.trim().is_empty() {
-                        self.corrections.insert(correction);
-                    }
+            }
+            EngineItem::Answer(answer) => self.answers.push(answer),
+            EngineItem::Correction(correction) => {
+                if !correction.trim().is_empty() {
+                    self.corrections.insert(correction);
                 }
-                EngineItem::Infobox(mut infobox) => {
-                    infobox.img_src = infobox.img_src.filter(|url| is_web_url(url));
-                    infobox.url = infobox.url.filter(|url| is_web_url(url));
-                    infobox.urls.retain(|link| is_web_url(&link.url));
-                    infobox.engine = engine_name.to_string();
-                    if infobox.id.is_empty() {
-                        infobox.id = format!("{engine_name}-{}", self.infoboxes.len());
-                    }
-                    match self
-                        .infoboxes
-                        .iter_mut()
-                        .find(|existing| existing.id == infobox.id)
-                    {
-                        Some(existing) => merge_infobox(existing, &infobox),
-                        None => self.infoboxes.push(infobox),
-                    }
+            }
+            EngineItem::Infobox(mut infobox) => {
+                infobox.img_src = infobox.img_src.filter(|url| is_web_url(url));
+                infobox.url = infobox.url.filter(|url| is_web_url(url));
+                infobox.urls.retain(|link| is_web_url(&link.url));
+                infobox.engine = engine_name.to_string();
+                if infobox.id.is_empty() {
+                    infobox.id = format!("{engine_name}-{}", self.infoboxes.len());
                 }
-                EngineItem::EngineData { key, value } => {
-                    self.engine_data
-                        .entry(engine_name.to_string())
-                        .or_default()
-                        .insert(key, value);
+                match self
+                    .infoboxes
+                    .iter_mut()
+                    .find(|existing| existing.id == infobox.id)
+                {
+                    Some(existing) => merge_infobox(existing, &infobox),
+                    None => self.infoboxes.push(infobox),
                 }
-                EngineItem::Result(mut result) => {
-                    result.deep_page = deep_page;
-                    // Unwrap engine redirectors; drop dead wrappers outright so
-                    // a redirector URL never reaches the user.
-                    match unwrap_redirect(&result.url) {
-                        Some(url) => result.url = url,
-                        None => continue,
-                    }
-                    let keyvalue = result.template == Template::KeyValue
-                        && result.url.starts_with("keyvalue:");
-                    if !keyvalue && !is_web_url(&result.url) {
-                        continue;
-                    }
-                    result.img_src = result.img_src.filter(|url| is_web_url(url));
-                    result.thumbnail = result.thumbnail.filter(|url| is_web_url(url));
-                    position = position.saturating_add(1);
-                    result.positions = vec![position];
-                    result.engine = engine_name.to_string();
-                    result.engines = vec![engine_name.to_string()];
-                    result.score = weight;
-                    let rank = SourceRank {
-                        weight,
-                        position,
-                        deep_page,
-                    };
-                    let key = dedup_key(&result.url);
-                    match self.index.get(&key).copied() {
-                        Some(existing) => {
-                            let merged = &mut self.main[existing];
-                            let ranks = &mut self.source_ranks[existing];
-                            match merged
-                                .engines
-                                .iter()
-                                .position(|engine| engine == engine_name)
-                            {
-                                Some(source) => {
-                                    let previous = ranks[source];
-                                    let score = rank.score(merged.priority);
-                                    let previous_score = previous.score(merged.priority);
-                                    if score > previous_score
-                                        || (score == previous_score && position < previous.position)
-                                    {
-                                        ranks[source] = rank;
-                                        merged.positions[source] = position;
-                                    }
-                                }
-                                None => {
-                                    ranks.push(rank);
-                                    merged.positions.push(position);
+            }
+            EngineItem::EngineData { key, value } => {
+                self.engine_data
+                    .entry(engine_name.to_string())
+                    .or_default()
+                    .insert(key, value);
+            }
+            EngineItem::Result(mut result) => {
+                result.deep_page = deep_page;
+                // Unwrap engine redirectors; drop dead wrappers outright so
+                // a redirector URL never reaches the user.
+                match unwrap_redirect(&result.url) {
+                    Some(url) => result.url = url,
+                    None => return,
+                }
+                let keyvalue =
+                    result.template == Template::KeyValue && result.url.starts_with("keyvalue:");
+                if !keyvalue && !is_web_url(&result.url) {
+                    return;
+                }
+                result.img_src = result.img_src.filter(|url| is_web_url(url));
+                result.thumbnail = result.thumbnail.filter(|url| is_web_url(url));
+                *position = position.saturating_add(1);
+                result.positions = vec![*position];
+                result.engine = engine_name.to_string();
+                result.engines = vec![engine_name.to_string()];
+                result.score = weight;
+                let rank = SourceRank {
+                    weight,
+                    position: *position,
+                    deep_page,
+                };
+                let key = dedup_key_with(&result.url, self.dedup.url_variants);
+                match self.index.get(&key).copied() {
+                    Some(existing) => {
+                        let merged = &mut self.main[existing];
+                        let ranks = &mut self.source_ranks[existing];
+                        match merged
+                            .engines
+                            .iter()
+                            .position(|engine| engine == engine_name)
+                        {
+                            Some(source) => {
+                                let previous = ranks[source];
+                                let score = rank.score(merged.priority);
+                                let previous_score = previous.score(merged.priority);
+                                if score > previous_score
+                                    || (score == previous_score && *position < previous.position)
+                                {
+                                    ranks[source] = rank;
+                                    merged.positions[source] = *position;
                                 }
                             }
-                            merged.deep_page =
-                                ranks.iter().map(|rank| rank.deep_page).min().unwrap_or(0);
-                            merge_result(merged, &result);
+                            None => {
+                                ranks.push(rank);
+                                merged.positions.push(*position);
+                            }
                         }
-                        None => {
-                            self.index.insert(key, self.main.len());
-                            self.main.push(result);
-                            self.source_ranks.push(vec![rank]);
-                        }
+                        merged.deep_page =
+                            ranks.iter().map(|rank| rank.deep_page).min().unwrap_or(0);
+                        merge_result(merged, &result);
+                    }
+                    None => {
+                        self.index.insert(key, self.main.len());
+                        self.main.push(result);
+                        self.source_ranks.push(vec![rank]);
                     }
                 }
             }
         }
     }
 
-    /// Score and freeze the container (upstream `close`).
+    /// Set how duplicate pages are collapsed. Call this before merging
+    /// results; the defaults keep both conservative rules on.
+    pub fn set_dedup(&mut self, policy: DedupPolicy) {
+        self.dedup = policy;
+    }
+
+    /// Score and freeze the container (upstream close).
+    ///
+    /// This keeps the historical signature: the consensus and title/snippet
+    /// terms are disabled, so a caller that does not know about them sees the
+    /// same scores as before. Use [ResultContainer::close_with] to enable them.
     pub fn close(
         &mut self,
         weight_of: impl Fn(&str) -> f64,
@@ -453,6 +538,22 @@ impl ResultContainer {
         relevance_weight: f64,
         query_text: &str,
         authority_weight: f64,
+    ) {
+        let options = RankingOptions {
+            relevance: relevance_weight,
+            authority: authority_weight,
+            ..RankingOptions::default()
+        };
+        self.close_with(weight_of, query_terms, query_text, &options);
+    }
+
+    /// Score and freeze the container with every configured ranking term.
+    pub fn close_with(
+        &mut self,
+        weight_of: impl Fn(&str) -> f64,
+        query_terms: &[String],
+        query_text: &str,
+        options: &RankingOptions,
     ) {
         if self.closed {
             return;
@@ -483,7 +584,20 @@ impl ResultContainer {
             // the query; this lifts the latter the way a neural ranker does.
             let rel = relevance(&result.url, &result.title, &result.content, query_terms);
             result.relevance_score = Some(rel);
-            result.score = score + relevance_weight * rel;
+            result.score = score + options.relevance * rel;
+            // Agreement is additive: a URL that two independent engines both
+            // returned is a stronger answer than one engine's lucky hit, even
+            // when the positions are the same.
+            if options.consensus > 0.0 {
+                result.score += options.consensus * consensus(result.engines.len());
+            }
+            // Title/snippet coverage is a separate knob from the URL-aware
+            // relevance term; a page whose title names the query is the answer
+            // even when its address does not repeat the words.
+            if options.text_match > 0.0 {
+                result.score +=
+                    options.text_match * text_match(&result.title, &result.content, query_terms);
+            }
             // Naming a site in the query means "that site's own page": lift the
             // canonical host and push mirrors down. This is the part keyword
             // and embedding ranking cannot see (official docs vs its mirror).
@@ -492,9 +606,9 @@ impl ResultContainer {
             if result.deep_page > 0 {
                 result.score *= 0.5f64.powf(f64::from(result.deep_page));
             }
-            if authority_weight > 0.0 {
+            if options.authority > 0.0 {
                 let signal = authority(query_text, &result.url) - 0.5;
-                result.score += authority_weight * signal;
+                result.score += options.authority * signal;
             }
             // A Wikipedia edition or a translated page in the wrong language
             // is noise for this query; one in the query's language is wanted.
@@ -508,8 +622,18 @@ impl ResultContainer {
             };
             let language = wikipedia_language_penalty(query_text, &result.url) + adjustment;
             if language != 0.0 {
-                result.score += relevance_weight * language;
+                result.score += options.relevance * language;
             }
+        }
+
+        // --- near-duplicate consolidation ---
+        // The URL key absorbs AMP, mobile and print copies, but the same
+        // article published under two paths of one host (a re-published
+        // version, a trailing-slash variant) can only be recognised from its
+        // title and body. A wrong merge destroys evidence, so only a nearly
+        // identical body qualifies.
+        if self.dedup.near_duplicates {
+            merge_near_duplicates(&mut self.main);
         }
 
         // --- 蒸留（上流超え）: 転載の統合 ---
@@ -750,6 +874,114 @@ fn distill_transfers(results: &mut Vec<SearchResult>, _query_terms: &[String]) {
     *results = keep;
 }
 
+/// Merge results that are the same page reached through a different address.
+///
+/// The URL key already collapses tracking parameters and explicit AMP/print
+/// copies. What remains is one host publishing the same page under two paths
+/// (a re-published article, a trailing-slash variant, a mobile layout on a
+/// subdomain). Title equality alone is not enough, because two different pages
+/// of one site can share a title. Both snippets must be long enough for a
+/// stable comparison and their character 4-gram Dice coefficient must be at
+/// least 0.9.
+fn merge_near_duplicates(results: &mut Vec<SearchResult>) {
+    if results.len() < 2 {
+        return;
+    }
+    let mut keep: Vec<SearchResult> = Vec::with_capacity(results.len());
+    'outer: for mut candidate in results.drain(..) {
+        let candidate_host = content_host(&candidate.url);
+        let candidate_title = normalize_title_for_dedup(&candidate.title);
+        if candidate_host.is_empty() || candidate_title.is_empty() {
+            keep.push(candidate);
+            continue 'outer;
+        }
+        let Some(candidate_grams) = body_grams(&candidate.content) else {
+            keep.push(candidate);
+            continue 'outer;
+        };
+        for existing in keep.iter_mut() {
+            if content_host(&existing.url) != candidate_host {
+                continue;
+            }
+            if normalize_title_for_dedup(&existing.title) != candidate_title {
+                continue;
+            }
+            let Some(existing_grams) = body_grams(&existing.content) else {
+                continue;
+            };
+            let overlap = existing_grams.intersection(&candidate_grams).count();
+            let dice = 2.0 * overlap as f64 / (existing_grams.len() + candidate_grams.len()) as f64;
+            if dice < 0.9 {
+                continue;
+            }
+            // Keep the stronger result as the representative and record where
+            // the other address came from, the same way distillation does.
+            existing
+                .merged_sources
+                .push(format!("{} | {}", candidate.title, candidate.url));
+            for engine in candidate.engines.drain(..) {
+                if !existing.engines.contains(&engine) {
+                    existing.engines.push(engine);
+                }
+            }
+            existing.positions.append(&mut candidate.positions);
+            if candidate.score > existing.score {
+                std::mem::swap(&mut existing.url, &mut candidate.url);
+                std::mem::swap(&mut existing.title, &mut candidate.title);
+                std::mem::swap(&mut existing.content, &mut candidate.content);
+                std::mem::swap(&mut existing.score, &mut candidate.score);
+                std::mem::swap(
+                    &mut existing.relevance_score,
+                    &mut candidate.relevance_score,
+                );
+            }
+            continue 'outer;
+        }
+        keep.push(candidate);
+    }
+    *results = keep;
+}
+
+/// The host a result belongs to, ignoring a mobile or AMP subdomain prefix.
+fn content_host(url: &str) -> String {
+    let Some(host) = host_of(url) else {
+        return String::new();
+    };
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    for prefix in ["m.", "mobile.", "amp."] {
+        if let Some(rest) = host.strip_prefix(prefix) {
+            if rest.contains('.') {
+                return rest.to_string();
+            }
+        }
+    }
+    host
+}
+
+/// Character 4-grams of a snippet, or None when it is too short to compare.
+///
+/// A short snippet is too generic to prove that two pages are the same, so
+/// merging stops there. Four-character shingles work for space-delimited and
+/// CJK text alike.
+fn body_grams(content: &str) -> Option<BTreeSet<String>> {
+    const MIN_CHARS: usize = 80;
+    const GRAM: usize = 4;
+    let normalized: Vec<char> = content
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect();
+    if normalized.len() < MIN_CHARS {
+        return None;
+    }
+    Some(
+        normalized
+            .windows(GRAM)
+            .map(|window| window.iter().collect())
+            .collect(),
+    )
+}
+
 /// Search engines wrap outbound links in their own redirector
 /// (\`google.com/goto?url=\`, \`duckduckgo.com/l/?uddg=\`, ...). Left alone, those
 /// wrappers pollute the result set with links that are not the page at all.
@@ -860,8 +1092,9 @@ pub fn filter_results(
     }
 }
 
-/// The deduplication key of a URL: scheme independent, without fragment and
-/// without the usual tracking parameters.
+/// The deduplication key of a URL: scheme independent, without fragment,
+/// without the usual tracking parameters and without an unambiguous copy
+/// marker (AMP or print variant of the same page).
 ///
 /// The key is assembled from the parsed URL structure, not by concatenating
 /// decoded text, so values and separators stay distinguishable:
@@ -872,13 +1105,27 @@ pub fn filter_results(
 /// - query pairs are re-encoded as pairs, so `?a=b%26c%3Dd` (one value holding
 ///   `&c=d`) never collapses into `?a=b&c=d` (two parameters);
 /// - query order is preserved, since servers may treat it as significant.
+///
+/// Copy markers are stripped only when they are unmistakable: a dedicated AMP
+/// or print query flag, a trailing `/amp` or `/print` segment that follows a
+/// real page, or a `.amp.html` / `.print.html` suffix. A page such as
+/// `/amp/settings` is untouched.
 pub fn dedup_key(url: &str) -> String {
+    dedup_key_with(url, true)
+}
+
+/// [dedup_key] with the copy-marker rules optionally disabled. The offline
+/// regression replays the previous URL-only rules through this switch.
+fn dedup_key_with(url: &str, strip_variants: bool) -> String {
     let trimmed = url.trim();
     let Ok(mut parsed) = url::Url::parse(trimmed) else {
         return trimmed.to_lowercase();
     };
     parsed.set_fragment(None);
     let _ = parsed.set_scheme("https");
+    if strip_variants {
+        strip_copy_markers(&mut parsed);
+    }
     let host = parsed.host_str().unwrap_or_default().to_lowercase();
     // `port()` keeps an explicit port unless it is the default for the current
     // scheme, and `set_scheme` does not renormalise, so compare explicitly.
@@ -903,6 +1150,82 @@ pub fn dedup_key(url: &str) -> String {
             format!("?{query}")
         }
     )
+}
+
+/// Remove the copy markers a site adds to the same page.
+///
+/// Every rule needs a positive marker, so a genuine page whose path contains
+/// the word amp or print (for example /amp/settings) is left alone.
+fn strip_copy_markers(parsed: &mut url::Url) {
+    // Query flags first: ?amp=1, ?print=1, ?output=amp.
+    let pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let kept: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(key, value)| !is_copy_marker_param(key, value))
+        .cloned()
+        .collect();
+    if kept.len() != pairs.len() {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in &kept {
+            serializer.append_pair(key, value);
+        }
+        let query = serializer.finish();
+        parsed.set_query(if query.is_empty() { None } else { Some(&query) });
+    }
+    // Path suffixes: /a/amp, /a/amp/, /a/amp.html, /a.print.html.
+    let mut segments: Vec<String> = parsed
+        .path_segments()
+        .map(|segment| segment.map(str::to_string).collect())
+        .unwrap_or_default();
+    while segments.last().is_some_and(|segment| segment.is_empty()) {
+        segments.pop();
+    }
+    let mut path_changed = false;
+    if let Some(last) = segments.last().cloned() {
+        let lower = last.to_ascii_lowercase();
+        let stripped = [".amp.html", ".print.html", ".amp", ".print"]
+            .iter()
+            .find_map(|suffix| {
+                lower
+                    .strip_suffix(suffix)
+                    .filter(|base| !base.is_empty())
+                    .map(|base| last[..base.len()].to_string())
+            });
+        if let Some(base) = stripped {
+            *segments.last_mut().expect("the last segment exists") = base;
+            path_changed = true;
+        } else if matches!(lower.as_str(), "amp" | "print" | "printable") && segments.len() > 1 {
+            // A bare trailing segment marks a copy only when a page precedes
+            // it; /amp on its own may be a real page and stays.
+            segments.pop();
+            path_changed = true;
+        }
+    }
+    // Only rewrite a path that actually carried a marker; otherwise the URL
+    // keeps the exact escaping it came with.
+    if path_changed {
+        let path = if segments.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", segments.join("/"))
+        };
+        parsed.set_path(&path);
+    }
+}
+
+/// Query parameters that only switch to a copy of the same page.
+fn is_copy_marker_param(key: &str, value: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    match key.as_str() {
+        "amp" | "print" | "printable" => matches!(value.as_str(), "" | "1" | "true" | "yes"),
+        "amp_js_v" => !value.is_empty(),
+        "output" => matches!(value.as_str(), "amp" | "print" | "printable"),
+        _ => false,
+    }
 }
 
 /// Tracking parameters removed when deduplicating (a subset of the ClearURLs
@@ -950,6 +1273,8 @@ pub fn pretty_url(url: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod quality;
 #[cfg(test)]
 mod tests {
 
@@ -1517,5 +1842,264 @@ mod tests {
             vec!["8".to_string(), "0".to_string(), "33".to_string()]
         );
         assert_ne!(title_numbers("PHP 8.0.33"), title_numbers("PHP 8.0.31"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Ranking terms (multi-source agreement, title/snippet match) and copies
+    // -------------------------------------------------------------------------
+
+    fn long_body(subject: &str) -> String {
+        format!("{subject} の説明です。").repeat(12)
+    }
+
+    #[test]
+    fn copy_markers_collapse_amp_and_print_variants() {
+        assert_eq!(
+            dedup_key("https://e.test/a/amp"),
+            dedup_key("https://e.test/a")
+        );
+        assert_eq!(
+            dedup_key("https://e.test/a?print=1"),
+            dedup_key("https://e.test/a")
+        );
+        assert_eq!(
+            dedup_key("https://e.test/a.amp.html"),
+            dedup_key("https://e.test/a")
+        );
+        assert_eq!(
+            dedup_key("https://e.test/a/print/"),
+            dedup_key("https://e.test/a")
+        );
+        // A real page whose path happens to say "amp" is not a copy.
+        assert_ne!(
+            dedup_key("https://e.test/amp/settings"),
+            dedup_key("https://e.test/settings")
+        );
+        assert_ne!(
+            dedup_key("https://e.test/amp"),
+            dedup_key("https://e.test/")
+        );
+        // Percent-encoded paths keep their escaping: rewriting the path only
+        // strips a marker and must not double-encode it.
+        assert_eq!(
+            dedup_key("https://e.test/%E5%AF%8C%E5%A3%AB/amp"),
+            dedup_key("https://e.test/%E5%AF%8C%E5%A3%AB")
+        );
+        assert_eq!(
+            dedup_key("https://e.test/a?amp=1&page=2"),
+            dedup_key("https://e.test/a?page=2")
+        );
+        // The previous URL-only rules remain available for a baseline replay.
+        assert_ne!(
+            dedup_key_with("https://e.test/a/amp", false),
+            dedup_key_with("https://e.test/a", false)
+        );
+    }
+
+    #[test]
+    fn copy_variants_merge_while_collecting() {
+        let mut container = ResultContainer::new();
+        container.extend("a", 1.0, vec![result("https://e.test/a", "page")]);
+        container.extend("b", 1.0, vec![result("https://e.test/a/amp", "page")]);
+        assert_eq!(container.main_results().len(), 1);
+        assert_eq!(container.main_results()[0].engines, ["a", "b"]);
+        assert_eq!(container.main_results()[0].url, "https://e.test/a");
+    }
+
+    #[test]
+    fn disabling_fuzzy_dedup_keeps_copy_urls_apart() {
+        let mut container = ResultContainer::new();
+        container.set_dedup(DedupPolicy {
+            url_variants: false,
+            near_duplicates: false,
+        });
+        container.extend("a", 1.0, vec![result("https://e.test/a", "page")]);
+        container.extend("b", 1.0, vec![result("https://e.test/a/amp", "page")]);
+        assert_eq!(container.main_results().len(), 2);
+    }
+
+    #[test]
+    fn a_mobile_copy_with_the_same_title_and_body_is_merged() {
+        let body = long_body("インストール手順");
+        let mut desktop = SearchResult::new("https://docs.e.test/guide", "Install guide");
+        desktop.content = body.clone();
+        let mut mobile = SearchResult::new("https://m.docs.e.test/guide", "Install guide");
+        mobile.content = body;
+        let mut container = ResultContainer::new();
+        container.extend("a", 1.0, vec![EngineItem::Result(desktop)]);
+        container.extend("b", 1.0, vec![EngineItem::Result(mobile)]);
+        container.close(|_| 1.0, &[], 0.0, "", 0.0);
+        assert_eq!(
+            container.main_results().len(),
+            1,
+            "the mobile copy is merged"
+        );
+        assert_eq!(container.main_results()[0].url, "https://docs.e.test/guide");
+        assert_eq!(
+            container.main_results()[0].merged_sources,
+            ["Install guide | https://m.docs.e.test/guide"]
+        );
+    }
+
+    #[test]
+    fn a_same_title_is_not_enough_when_the_bodies_differ() {
+        let mut first = SearchResult::new("https://docs.e.test/guide", "Install guide");
+        first.content = long_body("インストール手順");
+        let mut second = SearchResult::new("https://docs.e.test/changelog", "Install guide");
+        second.content = long_body("変更履歴");
+        let mut container = ResultContainer::new();
+        container.extend("a", 1.0, vec![EngineItem::Result(first)]);
+        container.extend("b", 1.0, vec![EngineItem::Result(second)]);
+        container.close(|_| 1.0, &[], 0.0, "", 0.0);
+        assert_eq!(container.main_results().len(), 2);
+    }
+
+    #[test]
+    fn short_snippets_are_never_merged_by_body_similarity() {
+        let mut first = SearchResult::new("https://docs.e.test/guide", "Install guide");
+        first.content = "same words".into();
+        let mut second = SearchResult::new("https://docs.e.test/guide-old", "Install guide");
+        second.content = "same words".into();
+        let mut container = ResultContainer::new();
+        container.extend("a", 1.0, vec![EngineItem::Result(first)]);
+        container.extend("b", 1.0, vec![EngineItem::Result(second)]);
+        container.close(|_| 1.0, &[], 0.0, "", 0.0);
+        assert_eq!(container.main_results().len(), 2);
+    }
+
+    fn corroborated_container() -> ResultContainer {
+        // "single" is the first hit of one engine. "shared" is the fifth
+        // hit of two engines: without the consensus term 0.8 < 1.0, and with
+        // it 0.8 + 0.5 * consensus(2) > 1.0.
+        let mut container = ResultContainer::new();
+        container.extend(
+            "a",
+            1.0,
+            vec![
+                result("https://e.test/single", "single"),
+                result("https://e.test/a2", "a2"),
+                result("https://e.test/a3", "a3"),
+                result("https://e.test/a4", "a4"),
+                result("https://e.test/shared", "shared"),
+            ],
+        );
+        container.extend(
+            "b",
+            1.0,
+            vec![
+                result("https://e.test/b1", "b1"),
+                result("https://e.test/b2", "b2"),
+                result("https://e.test/b3", "b3"),
+                result("https://e.test/b4", "b4"),
+                result("https://e.test/shared", "shared"),
+            ],
+        );
+        container
+    }
+
+    #[test]
+    fn consensus_lifts_a_page_two_engines_returned() {
+        let mut baseline = corroborated_container();
+        baseline.close(|_| 1.0, &[], 0.0, "", 0.0);
+        assert_eq!(baseline.ordered()[0].url, "https://e.test/single");
+
+        let mut boosted = corroborated_container();
+        boosted.close_with(
+            |_| 1.0,
+            &[],
+            "",
+            &RankingOptions {
+                consensus: 0.5,
+                ..RankingOptions::default()
+            },
+        );
+        assert_eq!(boosted.ordered()[0].url, "https://e.test/shared");
+        assert_eq!(boosted.ordered()[0].engines, ["a", "b"]);
+    }
+
+    #[test]
+    fn the_title_and_snippet_match_lifts_the_answering_page() {
+        let build = || {
+            let mut container = ResultContainer::new();
+            container.extend(
+                "a",
+                1.0,
+                vec![
+                    result("https://docs.e.test/one", "Untitled note"),
+                    EngineItem::result(
+                        SearchResult::new("https://docs.e.test/two", "Async runtime")
+                            .with_content("A guide to the async runtime and its scheduler."),
+                    ),
+                ],
+            );
+            container
+        };
+        let terms = query_terms("async runtime");
+        let mut baseline = build();
+        baseline.close(|_| 1.0, &terms, 0.0, "async runtime", 0.0);
+        assert_eq!(baseline.ordered()[0].url, "https://docs.e.test/one");
+
+        let mut boosted = build();
+        boosted.close_with(
+            |_| 1.0,
+            &terms,
+            "async runtime",
+            &RankingOptions {
+                text_match: 1.0,
+                ..RankingOptions::default()
+            },
+        );
+        assert_eq!(boosted.ordered()[0].url, "https://docs.e.test/two");
+    }
+
+    #[test]
+    fn the_default_terms_do_not_reorder_position_fusion() {
+        let shipped = crate::settings::Settings::defaults().search;
+        let build = || {
+            let mut container = ResultContainer::new();
+            container.extend(
+                "a",
+                1.0,
+                vec![
+                    result("https://e.test/first", "guide to the topic"),
+                    result("https://e.test/second", "another guide to the topic"),
+                ],
+            );
+            container
+        };
+        let terms = query_terms("guide topic");
+        let mut baseline = build();
+        baseline.close(|_| 1.0, &terms, 0.0, "guide topic", 0.0);
+        let mut with_defaults = build();
+        with_defaults.close_with(
+            |_| 1.0,
+            &terms,
+            "guide topic",
+            &RankingOptions {
+                relevance: 0.0,
+                authority: 0.0,
+                consensus: shipped.consensus_weight,
+                text_match: shipped.text_match_weight,
+            },
+        );
+        let order = |container: &ResultContainer| -> Vec<String> {
+            container
+                .ordered()
+                .iter()
+                .map(|result| result.url.clone())
+                .collect()
+        };
+        assert_eq!(order(&baseline), order(&with_defaults));
+    }
+
+    #[test]
+    fn zero_coefficients_keep_the_previous_scores() {
+        let mut legacy = corroborated_container();
+        legacy.close(|_| 1.0, &[], 0.0, "", 0.0);
+        let mut explicit = corroborated_container();
+        explicit.close_with(|_| 1.0, &[], "", &RankingOptions::default());
+        let legacy_scores: Vec<f64> = legacy.ordered().iter().map(|r| r.score).collect();
+        let explicit_scores: Vec<f64> = explicit.ordered().iter().map(|r| r.score).collect();
+        assert_eq!(legacy_scores, explicit_scores);
     }
 }

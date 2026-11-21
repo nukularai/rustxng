@@ -127,6 +127,22 @@ python3 tools/eval_quality.py --port 8888 \
 
 終了コードは `errors` が 1 件以上あると 1 です。0 件の実行だけを記録に使います。
 
+## オフライン回帰（2026-11-21 追加）
+
+ランキングと重複排除の変更（[RANKING-QUALITY.md](RANKING-QUALITY.md)）では、
+外部プロバイダーに問い合わせない固定フィクスチャで変更前後を比較できるように
+しました。記録済みの検索実行からエンジンごとの応答ウィンドウを再構成した
+`tests/fixtures/quality/engine-snapshots.json` を使います。
+
+```bash
+cargo test --lib results::quality -- --nocapture
+```
+
+このフィクスチャは英語 60 問・日本語 31 問で、**韓国語の記録済み実行が無いため
+60 問多言語セットの全体は含みません**。表に出る Hit@1 / Hit@5 / MRR は
+記録の再構成に対する回帰値であり、ライブの検索品質ではありません。
+多言語 60 問の変更前後比較は、この環境では実施していません（NOT_TESTED）。
+
 ## 検証
 
 ```bash

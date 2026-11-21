@@ -15,7 +15,9 @@ use crate::metrics::Metrics;
 use crate::network::Network;
 use crate::plugins::{PluginContext, PluginManager, UserInfo};
 use crate::query::{Query, TimeRange};
-use crate::results::{Infobox, ResultContainer, SearchResult, Timing, UnresponsiveEngine};
+use crate::results::{
+    DedupPolicy, Infobox, RankingOptions, ResultContainer, SearchResult, Timing, UnresponsiveEngine,
+};
 use crate::settings::Settings;
 
 /// Largest per-request `timeout_limit`, in seconds, that the HTTP layer
@@ -798,6 +800,10 @@ impl Searcher {
             .collect();
 
         let mut container = ResultContainer::new();
+        container.set_dedup(DedupPolicy {
+            url_variants: self.settings.search.dedup_fuzzy,
+            near_duplicates: self.settings.search.dedup_fuzzy,
+        });
         for outcome in outcomes {
             response.engines.push(outcome.engine.clone());
             match outcome.items {
@@ -847,17 +853,34 @@ impl Searcher {
         // Relevance re-ranking only applies when the response merges several
         // engines (the general search). A single pinned engine keeps the
         // engine's own order, which preserves exact SearXNG overlap@10.
-        let relevance_weight = if request.is_single_source() {
+        let single_source = request.is_single_source();
+        let relevance_weight = if single_source {
             0.0
         } else {
             self.settings.search.relevance_weight
         };
         // Canonical-site boost: naming a site means "that site's own page".
         let query_text = request.query.query_text();
-        let authority_weight = if request.is_single_source() {
+        let authority_weight = if single_source {
             0.0
         } else {
             self.settings.search.authority_weight
+        };
+        // Agreement and title/snippet match are merged-result terms: a single
+        // pinned engine keeps its own order, exactly like relevance above.
+        let ranking = RankingOptions {
+            relevance: relevance_weight,
+            authority: authority_weight,
+            consensus: if single_source {
+                0.0
+            } else {
+                self.settings.search.consensus_weight
+            },
+            text_match: if single_source {
+                0.0
+            } else {
+                self.settings.search.text_match_weight
+            },
         };
         let mut indexed_hits = BTreeMap::new();
         while let Some(outcome) = index_tasks.join_next().await {
@@ -938,12 +961,11 @@ impl Searcher {
             }
         }
 
-        container.close(
+        container.close_with(
             |engine| self.registry.weight_of(engine),
             &query_terms,
-            relevance_weight,
             &query_text,
-            authority_weight,
+            &ranking,
         );
 
         let mut results = container.ordered().to_vec();
@@ -2364,6 +2386,10 @@ mod orchestration_tests {
         let settings = Arc::make_mut(&mut searcher.settings);
         settings.search.relevance_weight = 0.0;
         settings.search.authority_weight = 0.0;
+        // This test isolates the routed weight, so every other ranking term
+        // stays off.
+        settings.search.consensus_weight = 0.0;
+        settings.search.text_match_weight = 0.0;
         let request = SearchRequest::new(query("arxiv needle", &searcher.registry));
         let response = searcher.search(request).await;
         assert_eq!(response.results[0].engine, "arxiv");

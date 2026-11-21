@@ -32,6 +32,7 @@ RustXNG の文書は目的別に分かれています。初めての場合は RE
 - [CONTENT-API.md](CONTENT-API.md): `/map`・`/extract`・`/mcp`（サイト列挙、構造化抽出、HTTP の MCP）
 - [AGENT-OUTPUT.md](AGENT-OUTPUT.md): MCP の出力契約とトークン予算
 - [BENCHMARK-MULTILINGUAL.md](BENCHMARK-MULTILINGUAL.md): 多言語の品質評価セットと実行手順
+- [RANKING-QUALITY.md](RANKING-QUALITY.md): ランキング項と重複排除の変更、既定値の根拠、オフライン回帰
 
 ## 性能と評価
 

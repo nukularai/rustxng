@@ -560,6 +560,18 @@ pub struct Search {
     /// 0 keeps pure upstream position fusion; higher values lift the page that
     /// actually matches the query the way a neural ranker does.
     pub relevance_weight: f64,
+    /// Weight of the multi-source agreement bonus: a result several engines
+    /// returned ranks above an equally placed result only one engine returned.
+    /// 0 disables the term.
+    pub consensus_weight: f64,
+    /// Weight of the title/snippet query-term match bonus. `relevance_weight`
+    /// also sees URL slugs and body depth; this term looks at the title and
+    /// snippet alone. 0 disables it.
+    pub text_match_weight: f64,
+    /// Merge AMP, mobile and print copies of one page, and results whose title
+    /// and body are nearly identical. The rules are deliberately strict, so a
+    /// false positive (merging two different pages) is unlikely.
+    pub dedup_fuzzy: bool,
     /// OpenAI-compatible embeddings endpoint for semantic re-ranking
     /// (e.g. the bundled tools/embed_server.py, or any cloud embeddings API).
     /// Empty disables semantic re-ranking.
@@ -680,6 +692,9 @@ impl Default for Search {
             early_stop_grace: 0.75,
             raw_content_limit: 5,
             relevance_weight: 4.0,
+            consensus_weight: 0.5,
+            text_match_weight: 0.1,
+            dedup_fuzzy: true,
             embedding_url: String::new(),
             embedding_model: "BAAI/bge-small-en-v1.5".into(),
             local_index_path: String::new(),
@@ -1243,6 +1258,7 @@ impl Settings {
             }
         }
         self.validate_cache()?;
+        self.validate_ranking()?;
         self.validate_suspension()?;
         self.validate_circuit()?;
         self.validate_research()?;
@@ -1288,6 +1304,22 @@ impl Settings {
                         engine.name
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// The ranking coefficients are added to the position-fusion score, so a
+    /// non-finite or negative value would make comparisons meaningless.
+    fn validate_ranking(&self) -> Result<(), SettingsError> {
+        for (name, value) in [
+            ("search.consensus_weight", self.search.consensus_weight),
+            ("search.text_match_weight", self.search.text_match_weight),
+        ] {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(SettingsError::Validation(format!(
+                    "{name} must be a finite number between 0 and 100, got {value}"
+                )));
             }
         }
         Ok(())
@@ -1454,6 +1486,16 @@ impl Settings {
             warnings.push(format!(
                 "search.max_page = 0 (no configured limit): the HTTP API still rejects page numbers above {MAX_PAGENO}"
             ));
+        }
+        for (key, value) in [
+            ("search.consensus_weight", self.search.consensus_weight),
+            ("search.text_match_weight", self.search.text_match_weight),
+        ] {
+            if value > 20.0 {
+                warnings.push(format!(
+                    "{key} = {value} is high enough to override position fusion"
+                ));
+            }
         }
         let loopback = matches!(
             self.server.bind_address.as_str(),
@@ -2367,6 +2409,37 @@ engines:
         let mut settings = Settings::defaults();
         settings.search.empty_result_cooldown = 366 * 24 * 60 * 60;
         assert!(settings.validate().is_err(), "the cooldown is bounded too");
+    }
+
+    #[test]
+    fn ranking_weights_are_finite_and_bounded() {
+        let mut settings = Settings::defaults();
+        settings.validate().expect("the shipped weights are valid");
+        for value in [-1.0, 100.5, f64::NAN, f64::INFINITY] {
+            settings.search.consensus_weight = value;
+            assert!(
+                settings.validate().is_err(),
+                "consensus_weight = {value} must be rejected"
+            );
+        }
+        settings.search.consensus_weight = 20.0;
+        settings.search.text_match_weight = 100.0;
+        settings.validate().expect("the upper bound is allowed");
+        assert!(
+            !settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("consensus_weight")),
+            "the default order of magnitude is not surprising"
+        );
+        settings.search.consensus_weight = 25.0;
+        assert!(
+            settings
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("consensus_weight")),
+            "a weight that can override fusion is explained"
+        );
     }
 
     #[test]
