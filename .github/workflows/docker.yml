@@ -69,7 +69,7 @@ jobs:
           actual=$(docker image inspect --format '{{.Architecture}}' rustxng-verify:local)
           test "$actual" = "$ARCH"
           bash tools/smoke_container.sh rustxng-verify:local "${RELEASE_TAG#v}"
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: ${{ !inputs.dry_run }}
         with:
           registry: ghcr.io
@@ -110,7 +110,7 @@ jobs:
       digest: ${{ steps.manifest.outputs.digest }}
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
